@@ -1,0 +1,12 @@
+streamlit
+google-generativeai
+google-genai
+python-dotenv
+pypdf
+tqdm
+watchdog
+PyMuPDF
+python-docx
+chromadb
+numpy
+huggingface_hub

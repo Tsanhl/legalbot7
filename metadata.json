@@ -1,0 +1,5 @@
+{
+  "name": "Doc AI",
+  "description": "A legal research assistant that analyzes uploaded documents and provides answers with inline OSCOLA citations.",
+  "requestFramePermissions": []
+}
