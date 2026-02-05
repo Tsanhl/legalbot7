@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../git-lfs-3.7.1"
+		}
+	],
+	"settings": {}
+}
