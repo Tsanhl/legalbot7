@@ -14,11 +14,12 @@ import uuid
 # Import services
 from knowledge_base import load_law_resource_index, get_knowledge_base_summary
 from gemini_service import (
-    initialize_knowledge_base, 
-    send_message_with_docs, 
+    initialize_knowledge_base,
+    send_message_with_docs,
     reset_session,
     encode_file_to_base64,
     detect_long_essay,
+    get_continuation_context,
     get_allowed_authorities_from_rag,
     sanitize_output_against_allowlist,
     strip_internal_reasoning
@@ -43,6 +44,11 @@ st.set_page_config(
 # Pending long-response handling (used when user must type "Part 1"/"Proceed now")
 if 'pending_long_prompt' not in st.session_state:
     st.session_state.pending_long_prompt = None
+
+# Multi-part response tracking: {'total_parts': N, 'current_part': 0}
+# Programmatically forces correct "Will Continue" / "(End of Answer)" endings
+if 'multipart_state' not in st.session_state:
+    st.session_state.multipart_state = None
 
 # Optional (slow) second-pass rewrite to tighten word counts.
 # Default OFF to keep latency low.
@@ -70,9 +76,11 @@ def _normalize_output_style(text: str) -> str:
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized
 
-def _enforce_end_of_answer(text: str) -> str:
+def _enforce_end_of_answer(text: str, force_continuation: bool = False) -> str:
     """
     Enforce a clean ending:
+    - If force_continuation is True (programmatic override for intermediate multi-part),
+      ALWAYS end with 'Will Continue to next part, say continue' regardless of model output.
     - If the response is an intermediate multi-part output (ends with a 'Will Continue...' line),
       DO NOT include any '(End of Answer)' marker.
     - Otherwise, ensure EXACTLY ONE '(End of Answer)' at the end (remove any duplicates/legacy markers).
@@ -95,6 +103,16 @@ def _enforce_end_of_answer(text: str) -> str:
         raw = raw[: min(leak_positions)].rstrip()
         if not raw:
             return "(End of Answer)"
+
+    # Programmatic override: if we KNOW this is an intermediate part, force "Will Continue"
+    if force_continuation:
+        # Strip ALL ending markers (both types)
+        cleaned = re.sub(r"\(End of Answer\)\s*", "", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\(End of Essay\)\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\(End of Problem Question\)\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?i)\n*will\s+continue\s+to\s+next\s+part.*$", "", cleaned, flags=re.MULTILINE)
+        cleaned = cleaned.strip()
+        return cleaned + "\n\nWill Continue to next part, say continue"
 
     continue_patterns = [
         r"will\s+continue\s+to\s+next\s+part,\s*say\s+continue",
@@ -1407,6 +1425,12 @@ def main():
                         # Wait for user to respond with their choice (proceed now or use parts approach)
                         if long_essay_info.get('await_user_choice'):
                             st.session_state.pending_long_prompt = prompt
+                            # Store multipart state so we can programmatically force correct endings
+                            total_parts = long_essay_info.get('suggested_parts', 2)
+                            st.session_state.multipart_state = {
+                                'total_parts': total_parts,
+                                'current_part': 0  # Will become 1 when Part 1 starts
+                            }
                             st.info("💡 **Please respond** with either:\n- \"Proceed now\" - I'll write 2500 words MAX\n- \"Part 1\" or your specific request - To start with the parts approach")
                             # Stop execution here - wait for user's next message
                             st.stop()
@@ -1459,11 +1483,36 @@ def main():
                 was_stopped = False
                 
                 try:
+                    # Track multi-part progress BEFORE the model call
+                    if is_starting_pending_long and prompt_lower == "proceed now":
+                        # "Proceed now" = single-shot response, cancel multi-part flow
+                        st.session_state.multipart_state = None
+                    elif st.session_state.multipart_state is not None:
+                        if is_starting_pending_long:
+                            # Starting Part 1
+                            st.session_state.multipart_state['current_part'] = 1
+                        else:
+                            ci = get_continuation_context(prompt)
+                            if ci.get('is_continuation'):
+                                # Continuing to next part
+                                st.session_state.multipart_state['current_part'] += 1
+                            else:
+                                # User asked something else — cancel multi-part flow
+                                st.session_state.multipart_state = None
+                    elif is_starting_pending_long:
+                        # Session may have restarted — reconstruct multipart state
+                        _lei = detect_long_essay(prompt_for_model)
+                        if _lei.get('is_long_essay') and _lei.get('suggested_parts', 0) > 1:
+                            st.session_state.multipart_state = {
+                                'total_parts': _lei['suggested_parts'],
+                                'current_part': 1
+                            }
+
                     # Build conversation history for context
                     # This enables the AI to remember prior Q&A and provide follow-up responses
                     conversation_history = get_conversation_history(current_project, include_current_message=False)
-                    
-                    # Use streaming for faster response  
+
+                    # Use streaming for faster response
                     # Pass history to enable conversation memory
                     # NOTE: Retrieval happens inside send_message_with_docs; we surface a status line above.
                     stream, rag_context = send_message_with_docs(
@@ -1702,7 +1751,16 @@ def main():
                         # rewrites (word-count fix, citation-fix) may reintroduce
                         # Law Trove labels, Source N references, or other artifacts.
                         final_response = strip_internal_reasoning(final_response)
-                        final_response = _enforce_end_of_answer(final_response)
+                        # Determine if this is an intermediate multi-part response
+                        # so we can programmatically force the correct ending marker
+                        _force_continue = False
+                        if st.session_state.multipart_state is not None:
+                            mp = st.session_state.multipart_state
+                            _force_continue = mp['current_part'] < mp['total_parts']
+                            if mp['current_part'] >= mp['total_parts']:
+                                # All parts done — clear multipart state
+                                st.session_state.multipart_state = None
+                        final_response = _enforce_end_of_answer(final_response, force_continuation=_force_continue)
                         if is_starting_pending_long:
                             st.session_state.pending_long_prompt = None
 
